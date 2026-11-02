@@ -8,10 +8,10 @@
 // 秘密は持たない・出さない（OIDC のトークンは ovsx が GitHub の ACTIONS_ID_TOKEN_REQUEST_* から直接取り、open-vsx.org が 5 分で失効する資格に交換する）。
 import {
   EXTENSION_NAME,
+  fetchWithRetry,
   isHttpNotFound,
   isHttpOk,
   PUBLISHER,
-  request,
   requireGithubActions,
   runAsMain,
   verifiedVsixPath,
@@ -32,7 +32,10 @@ const ACCESS_TOKEN_ENV_NAME = 'OVSX_PAT';
  * @returns {Promise<boolean>}
  */
 async function isPublishedOnOpenVsx(deps, version) {
-  const response = await request(deps, `${OPEN_VSX_API}/${PUBLISHER}/${EXTENSION_NAME}/${version}`);
+  const response = await fetchWithRetry(
+    deps,
+    `${OPEN_VSX_API}/${PUBLISHER}/${EXTENSION_NAME}/${version}`,
+  );
   if (isHttpOk(response)) return true;
   if (isHttpNotFound(response)) return false;
   throw new Error(`${OPEN_VSX_LABEL} の公開状況を確認できません（HTTP ${response.status}）`);
