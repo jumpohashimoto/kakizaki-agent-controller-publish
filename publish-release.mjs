@@ -25,8 +25,38 @@ const REQUEST_TIMEOUT_MS = 60_000;
 const HTTP_OK_MIN = 200;
 const HTTP_OK_MAX = 299;
 const HTTP_NOT_FOUND = 404;
-const POLL_INTERVAL_MS = 30_000;
+const HTTP_TOO_MANY_REQUESTS = 429;
+/** 一過性として再試行する応答（502・503・504。500 などは再試行しない） */
+const RETRYABLE_SERVER_STATUSES = Object.freeze([502, 503, 504]);
+const MS_PER_SECOND = 1000;
 export const MS_PER_MINUTE = 60_000;
+/**
+ * GitLab Release を待つ間隔。公開専用リポジトリの Runner の出口 IP は GitHub のプールで共有され、gitlab.com の未認証 API は
+ * IP 単位で回数が制限される（現行 500 回/分。提案中は 60 回/時で、ブラウンアウトで既に発動し得る）ため、1 run あたり 60 回/時以下にする。
+ * 一次情報: https://docs.gitlab.com/user/gitlab_com/rate_limits/（確認日 2026-11-03） secrets-scan:allow 公式文書の URL
+ */
+const RELEASE_POLL_INTERVAL_MS = MS_PER_MINUTE;
+/** 公開 API の反映を待つ（check）間隔 */
+const CHECK_POLL_INTERVAL_MS = 30_000;
+/** 回数制限（429）が Retry-After なしで続くときの待ちの上限 */
+const RATE_LIMIT_MAX_BACKOFF_MS = 5 * MS_PER_MINUTE;
+/** 再試行（fetchWithRetry）の最大試行回数と待ち。合計をジョブの timeout-minutes の余裕に収める（github-actions.test.ts が固定） */
+const RETRY_MAX_ATTEMPTS = 3;
+const RATE_LIMIT_RETRY_BASE_MS = 15_000;
+const RATE_LIMIT_RETRY_MAX_WAIT_MS = 30_000;
+const SERVER_ERROR_RETRY_BASE_MS = 5_000;
+/** 子プロセスへ渡す環境変数の許可リスト。公開の資格・送信先を変え得る変数（OVSX_*・VSCE_*・GH_TOKEN 等）は渡さない */
+const CHILD_ENV_ALLOWLIST = Object.freeze([
+  'PATH',
+  'HOME',
+  'TMPDIR',
+  'LANG',
+  'LC_ALL',
+  'CI',
+  'GITHUB_ACTIONS',
+  'ACTIONS_ID_TOKEN_REQUEST_URL',
+  'ACTIONS_ID_TOKEN_REQUEST_TOKEN',
+]);
 const DEFAULT_WAIT_MINUTES = 30;
 /**
  * wait の上限（分）。ワークフローのジョブの timeout-minutes は「この値 + CHECK_TIMEOUT_MS + 他のステップの余裕」に収める
@@ -39,6 +69,7 @@ export const MAX_WAIT_MINUTES = 30;
  */
 export const CHECK_TIMEOUT_MS = 20 * MS_PER_MINUTE;
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
+const SECONDS_PATTERN = /^\d+$/;
 const MINUTES_PATTERN = /^\d+$/;
 const PACKAGE_PER_PAGE = 100;
 const SUMS_LINE_PATTERN = /^([0-9a-f]{64}) [ *](.+)$/;
@@ -127,11 +158,91 @@ export const isHttpNotFound = (response) => response.status === HTTP_NOT_FOUND;
  * @param {string} url
  * @param {RequestInit} [init]
  */
-export const request = (deps, url, init = {}) =>
+const request = (deps, url, init = {}) =>
   deps.fetch(url, { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
 
 /** @param {unknown} error */
 const messageOf = (error) => (error instanceof Error ? error.message : String(error));
+
+/**
+ * 429 の応答が示す待ち時間（ミリ秒）。Retry-After（秒または日時）、無ければ RateLimit-ResetTime（日時）。読めなければ undefined。
+ * @param {Response} response
+ * @param {number} nowMs 現在時刻（日時の指定を差に直すため）
+ * @returns {number | undefined}
+ */
+export function retryAfterMs(response, nowMs) {
+  const retryAfter = response.headers.get('retry-after');
+  if (retryAfter !== null && SECONDS_PATTERN.test(retryAfter)) {
+    return Number(retryAfter) * MS_PER_SECOND;
+  }
+  for (const value of [retryAfter, response.headers.get('ratelimit-resettime')]) {
+    const at = value === null ? Number.NaN : Date.parse(value);
+    if (!Number.isNaN(at)) return Math.max(0, at - nowMs);
+  }
+  return undefined;
+}
+
+/**
+ * 再試行するときの待ち（ミリ秒）。再試行しない応答（成功・404 など）・待ちが長すぎる 429 は undefined。
+ * @param {Response} response
+ * @param {number} attempt 何回目の試行の応答か（1 始まり）
+ * @param {number} nowMs
+ * @returns {number | undefined}
+ */
+function retryWaitMs(response, attempt, nowMs) {
+  if (response.status === HTTP_TOO_MANY_REQUESTS) {
+    const wait = retryAfterMs(response, nowMs) ?? RATE_LIMIT_RETRY_BASE_MS * 2 ** (attempt - 1);
+    return wait <= RATE_LIMIT_RETRY_MAX_WAIT_MS ? wait : undefined;
+  }
+  return RETRYABLE_SERVER_STATUSES.includes(response.status)
+    ? SERVER_ERROR_RETRY_BASE_MS * 2 ** (attempt - 1)
+    : undefined;
+}
+
+/**
+ * 429（Retry-After を尊重）・502/503/504・通信の失敗を、短いバックオフで 3 回まで試す。待ちが長い 429 はジョブの時間に収めるため
+ * 待たずにその応答を返す（呼び出し側が失敗にし、`gh run rerun` で補う）。最後の応答（失敗でも）はそのまま返す。
+ * @param {Deps} deps
+ * @param {string} url
+ * @param {RequestInit} [init]
+ * @returns {Promise<Response>}
+ */
+export async function fetchWithRetry(deps, url, init = {}) {
+  for (let attempt = 1; ; attempt += 1) {
+    const isLast = attempt >= RETRY_MAX_ATTEMPTS;
+    /** @type {Response} */
+    let response;
+    try {
+      response = await request(deps, url, init);
+    } catch (error) {
+      if (isLast) throw error;
+      deps.log(`${url} へ接続できません（${messageOf(error)}）。再試行します`);
+      await deps.sleep(SERVER_ERROR_RETRY_BASE_MS * 2 ** (attempt - 1));
+      continue;
+    }
+    const waitMs = isLast ? undefined : retryWaitMs(response, attempt, deps.nowMs());
+    if (waitMs === undefined) return response;
+    deps.log(
+      `${url} が HTTP ${response.status} でした。${waitMs / MS_PER_SECOND} 秒待って再試行します`,
+    );
+    await deps.sleep(waitMs);
+  }
+}
+
+/**
+ * 子プロセス（unzip・vsce・ovsx）へ渡す環境変数。許可リストのものだけ（無い変数は作らない）。
+ * @param {Record<string, string | undefined>} env
+ * @returns {Record<string, string>}
+ */
+export function childProcessEnv(env) {
+  /** @type {Record<string, string>} */
+  const picked = {};
+  for (const name of CHILD_ENV_ALLOWLIST) {
+    const value = env[name];
+    if (value !== undefined) picked[name] = value;
+  }
+  return picked;
+}
 
 /**
  * GitLab Release が現れるまで待つ（publish:gitlab が VSIX・SHA256SUMS を置いてから Release を作るので、Release があれば揃っている）。
@@ -143,22 +254,58 @@ const messageOf = (error) => (error instanceof Error ? error.message : String(er
 export async function waitForRelease(deps, { version, waitMinutes }) {
   const releaseUrl = `${GITLAB_API}/projects/${encodeURIComponent(GITLAB_PROJECT_PATH)}/releases/v${version}`;
   const deadline = deps.nowMs() + waitMinutes * MS_PER_MINUTE;
+  let rateLimitedCount = 0;
   for (;;) {
+    let delayMs = RELEASE_POLL_INTERVAL_MS;
+    let limitNote = '';
     try {
       const response = await request(deps, releaseUrl);
       if (isHttpOk(response)) return;
-      if (!isHttpNotFound(response)) {
+      if (response.status === HTTP_TOO_MANY_REQUESTS) {
+        rateLimitedCount += 1;
+        ({ delayMs, limitNote } = rateLimitWait(response, rateLimitedCount, deps.nowMs()));
+        deps.log(
+          `GitLab Release を確認できません（${limitNote}）。${delayMs / MS_PER_SECOND} 秒待ちます`,
+        );
+      } else if (!isHttpNotFound(response)) {
+        rateLimitedCount = 0;
         deps.log(`GitLab Release を確認できません（HTTP ${response.status}）。待ちを続けます`);
+      } else {
+        rateLimitedCount = 0;
       }
     } catch (error) {
       deps.log(`GitLab Release を確認できません（${messageOf(error)}）。待ちを続けます`);
     }
-    if (deps.nowMs() + POLL_INTERVAL_MS > deadline) {
-      throw new Error(`GitLab Release v${version} が ${waitMinutes} 分以内に現れませんでした`);
+    if (deps.nowMs() + delayMs > deadline) {
+      const reason =
+        limitNote === '' ? '' : `（GitLab の回数制限で確認できていません: ${limitNote}）`;
+      throw new Error(
+        `GitLab Release v${version} が ${waitMinutes} 分以内に現れませんでした${reason}`,
+      );
     }
     deps.log(`GitLab Release v${version} を待っています`);
-    await deps.sleep(POLL_INTERVAL_MS);
+    await deps.sleep(delayMs);
   }
+}
+
+/**
+ * 429 を受けたときの次の待ちと、その説明。Retry-After があればそれ（間隔より短くはしない）、無ければ間隔から倍々（上限 5 分）。
+ * 429 は「未公開」ではない（待ちを続ける）。
+ * @param {Response} response
+ * @param {number} count 連続した 429 の回数（1 始まり）
+ * @param {number} nowMs
+ * @returns {{delayMs: number, limitNote: string}}
+ */
+function rateLimitWait(response, count, nowMs) {
+  const retryAfter = retryAfterMs(response, nowMs);
+  const backoff = Math.min(RELEASE_POLL_INTERVAL_MS * 2 ** (count - 1), RATE_LIMIT_MAX_BACKOFF_MS);
+  return {
+    delayMs: Math.max(RELEASE_POLL_INTERVAL_MS, retryAfter ?? backoff),
+    limitNote:
+      retryAfter === undefined
+        ? `回数制限（HTTP 429）`
+        : `回数制限（HTTP 429。Retry-After ${Math.ceil(retryAfter / MS_PER_SECOND)} 秒）`,
+  };
 }
 
 /**
@@ -168,7 +315,7 @@ export async function waitForRelease(deps, { version, waitMinutes }) {
  * @returns {Promise<Buffer>}
  */
 async function download(deps, url, label) {
-  const response = await request(deps, url);
+  const response = await fetchWithRetry(deps, url);
   if (!isHttpOk(response)) throw new Error(`${label} を取得できません（HTTP ${response.status}）`);
   return Buffer.from(await response.arrayBuffer());
 }
@@ -225,19 +372,24 @@ async function verifyManifest(deps, vsixPath, version) {
  */
 async function verifyRegistryFiles(deps, { version, vsixName, expectedSha256 }) {
   const projectApi = `${GITLAB_API}/projects/${encodeURIComponent(GITLAB_PROJECT_PATH)}`;
-  const listed = await request(
+  const listed = await fetchWithRetry(
     deps,
     `${projectApi}/packages?package_type=generic&package_name=${GENERIC_PACKAGE_NAME}&package_version=${version}`,
   );
   if (!isHttpOk(listed)) {
     throw new Error(`Package Registry の置き場を確認できません（HTTP ${listed.status}）`);
   }
-  const packages = /** @type {Array<{id?: unknown}>} */ (await listed.json());
-  const packageId = Array.isArray(packages) ? packages[0]?.id : undefined;
+  // package_name は部分一致のため、先頭を信じず名前と版が完全に一致するパッケージを選ぶ（別名のパッケージの一覧を照合しない）
+  const packages = /** @type {Array<{id?: unknown, name?: unknown, version?: unknown}>} */ (
+    await listed.json()
+  );
+  const packageId = Array.isArray(packages)
+    ? packages.find((entry) => entry.name === GENERIC_PACKAGE_NAME && entry.version === version)?.id
+    : undefined;
   if (typeof packageId !== 'number') {
     throw new Error(`Package Registry に ${GENERIC_PACKAGE_NAME}@${version} がありません`);
   }
-  const filesResponse = await request(
+  const filesResponse = await fetchWithRetry(
     deps,
     `${projectApi}/packages/${packageId}/package_files?per_page=${PACKAGE_PER_PAGE}`,
   );
@@ -345,8 +497,8 @@ export async function waitUntilPublished(deps, { label, version, isPublished }) 
     } catch (error) {
       deps.log(`公開状況を確認できません（${messageOf(error)}）。待ちを続けます`);
     }
-    if (deps.nowMs() + POLL_INTERVAL_MS > deadline) break;
-    await deps.sleep(POLL_INTERVAL_MS);
+    if (deps.nowMs() + CHECK_POLL_INTERVAL_MS > deadline) break;
+    await deps.sleep(CHECK_POLL_INTERVAL_MS);
   }
   if (!hasAnswered) {
     throw new Error(
@@ -393,6 +545,7 @@ function realDeps() {
     run: (command, args, { inherit = false } = {}) =>
       new Promise((resolve, reject) => {
         const child = spawn(command, args, {
+          env: childProcessEnv(process.env),
           stdio: ['ignore', inherit ? 'inherit' : 'pipe', 'inherit'],
         });
         let stdout = '';
