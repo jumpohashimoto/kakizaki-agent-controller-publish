@@ -1,0 +1,14 @@
+# 依存の更新は GitLab の Renovate が担う（正本は GitLab のリポジトリ。release.mjs github-sync で複写する）。
+# GitHub 側の Dependabot は版の更新の PR を作らない（セキュリティ更新の通知だけを残す）。
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 0
