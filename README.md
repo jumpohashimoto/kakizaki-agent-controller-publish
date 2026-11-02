@@ -6,7 +6,7 @@ Marketplace の Trusted Publishing は GitHub Actions と Azure Pipelines だけ
 
 ## このリポジトリの内容
 
-このリポジトリのファイルは、GitLab のリポジトリの `src/github-actions/`（と `.node-version`・`LICENSE`）が正本です。**ここを直接編集しません**。GitLab 側で変更し、`node src/scripts/release.mjs github-sync` で複写します（`release.mjs tag` は、ここが正本と一致していないとタグを付けずに止まります）。依存（`@vscode/vsce`）の更新も GitLab 側の Renovate が行います。
+このリポジトリのファイルは、GitLab のリポジトリの `src/github-actions/`（と `.node-version`・`LICENSE`）が正本です。**ここを直接編集しません**。GitLab 側で変更し、`node src/scripts/release.mjs github-sync` で複写します（`release.mjs tag` は、ここが正本と一致していない、または正本に無いワークフローがあると、タグを付けずに止まります）。依存（`@vscode/vsce`）の更新も GitLab 側の Renovate が行います。
 
 | ファイル | 内容 |
 |---|---|
@@ -18,9 +18,9 @@ Marketplace の Trusted Publishing は GitHub Actions と Azure Pipelines だけ
 ## ワークフローの流れ
 
 1. `wait`: GitLab の Release `v<version>` が現れるまで待つ（既定 30 分）。
-2. `verify`: Release の `SHA256SUMS` と VSIX を取得し、SHA-256 が一致し、VSIX の `package.json` の版・publisher・名前が入力と一致したときだけ進む（再ビルドしません）。
+2. `verify`: Release の `SHA256SUMS` を取得し、GitLab の Package Registry のファイル一覧（公開 API）で VSIX と `SHA256SUMS` が各 1 件だけ登録されていて VSIX の `file_sha256` が `SHA256SUMS` と一致することを確かめてから、VSIX を取得する。SHA-256 が一致し、VSIX の `package.json` の版・publisher・名前が入力と一致したときだけ進む（再ビルドしません）。
 3. `publish`: Marketplace に未公開なら `vsce publish --oidc --no-dependencies --packagePath <VSIX> --skip-duplicate` で公開する（公開済みなら何もしない）。
-4. `check`: Marketplace の公開 API に版が載ったことを確かめる。
+4. `check`: Marketplace の公開 API に版が載ったことを確かめる（最大 20 分待つ。公開は成功したが反映を確認できないときは、警告を出して正常に終わる）。
 
 ## Marketplace の Trusted Publishing のポリシー
 
