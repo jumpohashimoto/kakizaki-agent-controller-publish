@@ -1,0 +1,44 @@
+# Open VSX への公開（Trusted Publishing）。GitLab のリポジトリが正本で、release.mjs github-sync が複写する（docs/PUBLISHING.md §5.1）。
+# 手動（workflow_dispatch）だけで動く。release.mjs tag が起動する。定期実行・push・pull request では動かない。
+# GitLab Release の VSIX を取得し、SHA256SUMS と照合してから ovsx publish --trusted-publishing で出す（再ビルドしない・トークンを持たない）。
+name: publish-openvsx
+run-name: publish-openvsx ${{ inputs.version }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: x.y.z（GitLab Release のタグ v<version>）
+        required: true
+        type: string
+      wait-minutes:
+        description: GitLab Release が現れるのを待つ上限（分）
+        required: false
+        default: "30"
+        type: string
+
+permissions: {}
+
+concurrency: { group: publish-openvsx, cancel-in-progress: false }
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: openvsx
+    timeout-minutes: 60
+    permissions: { id-token: write, contents: read }
+    env:
+      VERSION: ${{ inputs.version }}
+      WAIT_MINUTES: ${{ inputs.wait-minutes }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .node-version
+      - run: npm ci --ignore-scripts
+      - run: node publish-openvsx.mjs wait --version "$VERSION" --wait-minutes "$WAIT_MINUTES"
+      - run: node publish-openvsx.mjs verify --version "$VERSION"
+      - run: node publish-openvsx.mjs publish --version "$VERSION"
+      - run: node publish-openvsx.mjs check --version "$VERSION"
