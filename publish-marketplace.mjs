@@ -34,10 +34,19 @@ const HTTP_NOT_FOUND = 404;
 const POLL_INTERVAL_MS = 30_000;
 const MS_PER_MINUTE = 60_000;
 const DEFAULT_WAIT_MINUTES = 30;
-const MAX_WAIT_MINUTES = 120;
-const CHECK_TIMEOUT_MS = 5 * MS_PER_MINUTE;
+/**
+ * wait の上限（分）。ワークフローのジョブの timeout-minutes は「この値 + CHECK_TIMEOUT_MS + 他のステップの余裕」に収める
+ * （GitHub に途中で打ち切られて原因がログに残らない状況を作らない。github-actions.test.ts が固定）。
+ */
+export const MAX_WAIT_MINUTES = 30;
+/**
+ * check の上限。Marketplace は公開した版を検証してから一覧に載せるため、反映に時間がかかる（所要時間は公式文書になく未確認。
+ * 次の版の本番の run で実測して見直す）。超えても公開自体は成功しているので、失敗にはしない（checkPublished）。
+ */
+export const CHECK_TIMEOUT_MS = 20 * MS_PER_MINUTE;
 const VERSION_PATTERN = /^\d+\.\d+\.\d+$/;
 const MINUTES_PATTERN = /^\d+$/;
+const PACKAGE_PER_PAGE = 100;
 const SUMS_LINE_PATTERN = /^([0-9a-f]{64}) [ *](.+)$/;
 const COMMANDS = Object.freeze(['wait', 'verify', 'publish', 'check']);
 const USAGE =
@@ -197,6 +206,54 @@ async function verifyManifest(deps, vsixPath, version) {
 }
 
 /**
+ * Package Registry のファイル一覧（公開 API・認証なし）で、VSIX・SHA256SUMS が各 1 件だけ登録されていて、
+ * VSIX の file_sha256 が SHA256SUMS の値と一致することを確かめる。generic パッケージは同名ファイルの重複登録を許し、
+ * ダウンロード URL は最新を返すため、後から差し替えられていないかを本体の取得前に検出する（docs/PUBLISHING.md §5.1）。
+ * @param {Deps} deps
+ * @param {{version: string, vsixName: string, expectedSha256: string}} options
+ * @returns {Promise<void>}
+ */
+async function verifyRegistryFiles(deps, { version, vsixName, expectedSha256 }) {
+  const projectApi = `${GITLAB_API}/projects/${encodeURIComponent(GITLAB_PROJECT_PATH)}`;
+  const listed = await request(
+    deps,
+    `${projectApi}/packages?package_type=generic&package_name=${GENERIC_PACKAGE_NAME}&package_version=${version}`,
+  );
+  if (!isHttpOk(listed)) {
+    throw new Error(`Package Registry の置き場を確認できません（HTTP ${listed.status}）`);
+  }
+  const packages = /** @type {Array<{id?: unknown}>} */ (await listed.json());
+  const packageId = Array.isArray(packages) ? packages[0]?.id : undefined;
+  if (typeof packageId !== 'number') {
+    throw new Error(`Package Registry に ${GENERIC_PACKAGE_NAME}@${version} がありません`);
+  }
+  const filesResponse = await request(
+    deps,
+    `${projectApi}/packages/${packageId}/package_files?per_page=${PACKAGE_PER_PAGE}`,
+  );
+  if (!isHttpOk(filesResponse)) {
+    throw new Error(`Package Registry のファイルを確認できません（HTTP ${filesResponse.status}）`);
+  }
+  const files = /** @type {Array<{file_name?: unknown, file_sha256?: unknown}>} */ (
+    await filesResponse.json()
+  );
+  for (const name of [vsixName, SHA256_SUMS_NAME]) {
+    const count = Array.isArray(files) ? files.filter((file) => file.file_name === name).length : 0;
+    if (count !== 1) {
+      throw new Error(
+        `${name} が Package Registry に ${count} 件登録されています（1 件だけのはずです。重複は後から差し替えられた疑いがあるため、GitLab 側で確かめてください）`,
+      );
+    }
+  }
+  const registered = files.find((file) => file.file_name === vsixName)?.file_sha256;
+  if (registered !== expectedSha256) {
+    throw new Error(
+      `${vsixName} の Package Registry の file_sha256 が ${SHA256_SUMS_NAME} と一致しません`,
+    );
+  }
+}
+
+/**
  * GitLab Release の SHA256SUMS と VSIX を取得し、SHA-256 が一致したときだけ作業ディレクトリへ置く。再ビルドはしない。
  * @param {Deps} deps
  * @param {{version: string}} options
@@ -210,6 +267,7 @@ export async function verifyRelease(deps, { version }) {
   );
   const expected = sha256sFor(sums, name);
   if (expected === undefined) throw new Error(`${SHA256_SUMS_NAME} に ${name} の行がありません`);
+  await verifyRegistryFiles(deps, { version, vsixName: name, expectedSha256: expected });
   const vsix = await download(deps, `${base}/${name}`, name);
   const actual = createHash('sha256').update(vsix).digest('hex');
   if (actual !== expected) {
@@ -305,16 +363,23 @@ export async function publishVersion(deps, { version }) {
 }
 
 /**
- * Marketplace の公開 API に版が載るまで待つ（反映の遅れ・一過性の失敗は待つ。上限 5 分）。
+ * Marketplace の公開 API に版が載るまで待つ（反映の遅れ・一過性の失敗は待つ。上限は CHECK_TIMEOUT_MS）。
+ * このステップに来るのは publish が成功（または公開済みで何もしなかった）あとなので、上限を過ぎても載らないのは
+ * 「公開は成功・反映未確認」であり、失敗にしない（失敗にすると、公開できているのに run が failure になり、
+ * release.mjs install が公開の失敗と案内してしまう）。警告（GitHub Actions の注釈）を出して正常に終える。
+ * ただし上限まで公開 API に一度も問い合わせできなかったときは、成否を言えないので失敗にする。
  * @param {Deps} deps
  * @param {{version: string}} options
  * @returns {Promise<void>}
  */
 export async function checkPublished(deps, { version }) {
   const deadline = deps.nowMs() + CHECK_TIMEOUT_MS;
+  let hasAnswered = false;
   for (;;) {
     try {
-      if ((await publishedVersions(deps)).includes(version)) {
+      const versions = await publishedVersions(deps);
+      hasAnswered = true;
+      if (versions.includes(version)) {
         deps.log(`Marketplace に ${PUBLISHER}.${EXTENSION_NAME}@${version} を確認しました`);
         return;
       }
@@ -323,13 +388,17 @@ export async function checkPublished(deps, { version }) {
         `公開状況を確認できません（${error instanceof Error ? error.message : String(error)}）。待ちを続けます`,
       );
     }
-    if (deps.nowMs() + POLL_INTERVAL_MS > deadline) {
-      throw new Error(
-        `Marketplace に ${PUBLISHER}.${EXTENSION_NAME}@${version} が現れませんでした（反映に時間がかかっている可能性があります。管理ページを確認してください）`,
-      );
-    }
+    if (deps.nowMs() + POLL_INTERVAL_MS > deadline) break;
     await deps.sleep(POLL_INTERVAL_MS);
   }
+  if (!hasAnswered) {
+    throw new Error(
+      `Marketplace の公開状況を一度も確認できませんでした（${CHECK_TIMEOUT_MS / MS_PER_MINUTE} 分間。公開の成否は管理ページで確認してください）`,
+    );
+  }
+  deps.log(
+    `::warning::公開は成功しましたが、${CHECK_TIMEOUT_MS / MS_PER_MINUTE} 分以内に Marketplace の公開 API で ${PUBLISHER}.${EXTENSION_NAME}@${version} の反映を確認できていません（Marketplace が検証中の可能性があります。release.mjs install が反映を待ちます）`,
+  );
 }
 
 /**
