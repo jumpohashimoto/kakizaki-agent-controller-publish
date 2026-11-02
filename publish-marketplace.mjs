@@ -8,9 +8,9 @@
 // 秘密は持たない・出さない（OIDC のトークンは vsce が GitHub の ACTIONS_ID_TOKEN_REQUEST_* から直接取る）。
 import {
   EXTENSION_NAME,
+  fetchWithRetry,
   isHttpOk,
   PUBLISHER,
-  request,
   requireGithubActions,
   runAsMain,
   verifiedVsixPath,
@@ -34,7 +34,7 @@ const QUERY_FLAGS = 1 | 16;
  * @returns {Promise<string[]>}
  */
 async function publishedVersions(deps) {
-  const response = await request(deps, MARKETPLACE_QUERY_URL, {
+  const response = await fetchWithRetry(deps, MARKETPLACE_QUERY_URL, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
