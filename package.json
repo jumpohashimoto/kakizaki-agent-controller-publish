@@ -1,0 +1,12 @@
+{
+  "name": "agent-controller-marketplace-publisher",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Marketplace への公開（GitHub Actions の Trusted Publishing）に使う vsce の固定（lockfile 付き）。正本は GitLab のリポジトリの src/github-actions/。docs/PUBLISHING.md §5.1",
+  "dependencies": {
+    "@vscode/vsce": "4.1.0"
+  },
+  "overrides": {
+    "minimatch": "11.0.3"
+  }
+}
