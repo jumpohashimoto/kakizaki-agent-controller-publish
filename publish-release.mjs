@@ -384,7 +384,9 @@ async function verifyRegistryFiles(deps, { version, vsixName, expectedSha256 }) 
     await listed.json()
   );
   const packageId = Array.isArray(packages)
-    ? packages.find((entry) => entry.name === GENERIC_PACKAGE_NAME && entry.version === version)?.id
+    ? packages
+        .filter((entry) => typeof entry === 'object' && entry !== null)
+        .find((entry) => entry.name === GENERIC_PACKAGE_NAME && entry.version === version)?.id
     : undefined;
   if (typeof packageId !== 'number') {
     throw new Error(`Package Registry に ${GENERIC_PACKAGE_NAME}@${version} がありません`);
@@ -399,15 +401,25 @@ async function verifyRegistryFiles(deps, { version, vsixName, expectedSha256 }) 
   const files = /** @type {Array<{file_name?: unknown, file_sha256?: unknown}>} */ (
     await filesResponse.json()
   );
+  // 外部 JSON の要素はレコードだけを見る（null などで TypeError にしない）
+  const entries = Array.isArray(files)
+    ? files.filter((file) => typeof file === 'object' && file !== null)
+    : [];
+  // 1 ページ目しか取得しないため、満杯なら 2 ページ目以降の重複を見落とし得る。照合できないものは通さない
+  if (Array.isArray(files) && files.length >= PACKAGE_PER_PAGE) {
+    throw new Error(
+      `Package Registry のファイルが ${PACKAGE_PER_PAGE} 件以上あり、重複を照合できません（GitLab 側で確かめてください）`,
+    );
+  }
   for (const name of [vsixName, SHA256_SUMS_NAME]) {
-    const count = Array.isArray(files) ? files.filter((file) => file.file_name === name).length : 0;
+    const count = entries.filter((file) => file.file_name === name).length;
     if (count !== 1) {
       throw new Error(
         `${name} が Package Registry に ${count} 件登録されています（1 件だけのはずです。重複は後から差し替えられた疑いがあるため、GitLab 側で確かめてください）`,
       );
     }
   }
-  const registered = files.find((file) => file.file_name === vsixName)?.file_sha256;
+  const registered = entries.find((file) => file.file_name === vsixName)?.file_sha256;
   if (registered !== expectedSha256) {
     throw new Error(
       `${vsixName} の Package Registry の file_sha256 が ${SHA256_SUMS_NAME} と一致しません`,
@@ -549,6 +561,7 @@ function realDeps() {
           stdio: ['ignore', inherit ? 'inherit' : 'pipe', 'inherit'],
         });
         let stdout = '';
+        child.stdout?.setEncoding('utf8');
         child.stdout?.on('data', (chunk) => {
           stdout += chunk;
         });
